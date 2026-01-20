@@ -279,8 +279,7 @@ class SparkPipeline:
         logger.info(f"Reading from Iceberg table: {full_table_name}")
         df = spark.table(full_table_name)
 
-        row_count = df.count()
-        logger.info(f"Read {row_count:,} rows from {full_table_name}")
+        logger.info(f"Loaded DataFrame from {full_table_name}")
         return df
 
     def load_to_starrocks(
@@ -307,18 +306,22 @@ class SparkPipeline:
         starrocks_url = f"{settings.starrocks_jdbc_url}/{target_schema}"
 
         # Determine partitions for JDBC write
-        # For 20GB, we want higher parallelism, but capped to avoid too many small files/connections
-        num_partitions = df.rdd.getNumPartitions()
-        if num_partitions > 32: 
-            num_partitions = 32 # Safe default cap for StarRocks ingestion
-        
-        # Ensure at least 4 partitions for performance
-        if num_partitions < 4:
-            num_partitions = 4
+        # Use JDBC_NUM_PARTITIONS from settings for StarRocks writes
+        # This allows controlling parallelism for low-RAM StarRocks servers
+        num_partitions = settings.jdbc_num_partitions
+
+        # If not set in config, use DataFrame's partition count
+        if num_partitions == 0 or num_partitions is None:
+            num_partitions = df.rdd.getNumPartitions()
+            if num_partitions > 32:
+                num_partitions = 32 # Safe default cap
+            if num_partitions < 4:
+                num_partitions = 4  # Minimum for performance
         
         logger.info(f"Writing to StarRocks with {num_partitions} partitions")
 
-        # Write to StarRocks via JDBC
+        # Write to StarRocks via JDBC with optimized connection settings
+        # Skip df.count() to avoid scanning S3 twice
         df.write.format("jdbc").option("url", starrocks_url).option(
             "dbtable", f"`{target_schema}`.`{table_name}`"
         ).option("user", settings.starrocks_user).option(
@@ -329,12 +332,26 @@ class SparkPipeline:
             "batchsize", str(settings.batch_size)
         ).option(
             "numPartitions", str(num_partitions)
+        ).option(
+            "isolationLevel", "NONE"  # Faster writes, no transaction overhead
+        ).option(
+            "queryTimeout", "0"  # Disable query timeout for large batches
+        ).option(
+            "socketTimeout", "0"  # Disable socket timeout
+        ).option(
+            "connectTimeout", "30000"  # 30 second connection timeout
+        ).option(
+            "rewriteBatchedStatements", "true"  # Enable batch rewrite for speed
+        ).option(
+            "cachePrepStmts", "true"  # Cache prepared statements
+        ).option(
+            "useServerPrepStmts", "false"  # Client-side prepared statements (faster)
         ).mode(
             mode
         ).save()
 
         logger.info(
-            f"Successfully loaded {df.count():,} rows to StarRocks table "
+            f"Successfully loaded data to StarRocks table "
             f"{target_schema}.{table_name}"
         )
 

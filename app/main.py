@@ -4,13 +4,44 @@ Provides endpoints for table and schema migration
 """
 
 import logging
+from logging.handlers import RotatingFileHandler
 from typing import Optional, List
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from pydantic import BaseModel, Field
 from app.services.migration_orchestrator import orchestrator
 from app.config import settings
+import os
 
-logging.basicConfig(level=logging.INFO)
+# Configure logging to both file and console
+log_dir = "logs"
+os.makedirs(log_dir, exist_ok=True)
+
+# Create formatter
+formatter = logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
+# File handler with rotation (max 50MB, keep 5 backup files)
+file_handler = RotatingFileHandler(
+    f"{log_dir}/migration.log",
+    maxBytes=50*1024*1024,  # 50MB
+    backupCount=5
+)
+file_handler.setFormatter(formatter)
+file_handler.setLevel(logging.INFO)
+
+# Console handler
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+console_handler.setLevel(logging.INFO)
+
+# Configure root logger
+logging.basicConfig(
+    level=logging.INFO,
+    handlers=[file_handler, console_handler]
+)
+
 logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
@@ -281,6 +312,202 @@ def get_configuration():
             "executor_memory": settings.spark_executor_memory,
         },
     }
+
+
+class S3ToStarRocksRequest(BaseModel):
+    """Request model for loading from S3 to StarRocks"""
+
+    target_schema: str = Field(
+        default="WorldZone_glue", description="StarRocks target schema name"
+    )
+    table_list: Optional[List[str]] = Field(
+        default=None, description="Specific tables to load (None = all tables)"
+    )
+    skip_until: Optional[str] = Field(
+        default=None, description="Skip tables until this table (exclusive - will start AFTER this table)"
+    )
+    exclude_tables: Optional[List[str]] = Field(
+        default=None, description="List of table names to exclude from migration (e.g., large tables)"
+    )
+
+
+def run_s3_to_starrocks_migration(job_id: int, request: S3ToStarRocksRequest):
+    """Background task for S3 to StarRocks migration"""
+    import boto3
+    from app.services.spark_pipeline import pipeline
+    from app.services.schema_mapper import mapper
+    import time
+
+    try:
+        migration_jobs[job_id]["status"] = "running"
+        logger.info(f"Starting S3 to StarRocks migration job {job_id}")
+
+        # Get tables from Glue
+        glue_client = boto3.client(
+            'glue',
+            region_name=settings.aws_region,
+            aws_access_key_id=settings.aws_access_key_id,
+            aws_secret_access_key=settings.aws_secret_access_key
+        )
+
+        glue_database = f"worldzone_glue{settings.target_schema_suffix}"
+
+        tables = []
+        next_token = None
+
+        while True:
+            if next_token:
+                response = glue_client.get_tables(
+                    DatabaseName=glue_database,
+                    NextToken=next_token
+                )
+            else:
+                response = glue_client.get_tables(DatabaseName=glue_database)
+
+            for table in response.get('TableList', []):
+                tables.append(table['Name'])
+
+            next_token = response.get('NextToken')
+            if not next_token:
+                break
+
+        # Filter if specific tables requested
+        if request.table_list:
+            tables = [t for t in tables if t.lower() in [tl.lower() for tl in request.table_list]]
+
+        # Sort tables alphabetically
+        tables = sorted(tables)
+
+        # Exclude tables if specified (e.g., large tables)
+        if request.exclude_tables:
+            exclude_lower = [t.lower() for t in request.exclude_tables]
+            original_count = len(tables)
+            tables = [t for t in tables if t.lower() not in exclude_lower]
+            excluded_count = original_count - len(tables)
+            logger.info(f"Excluded {excluded_count} tables: {', '.join(request.exclude_tables[:5])}{'...' if len(request.exclude_tables) > 5 else ''}")
+
+        # Skip tables until specified table (for resuming migrations)
+        if request.skip_until:
+            skip_table = request.skip_until.lower()
+            try:
+                skip_index = [t.lower() for t in tables].index(skip_table)
+                tables = tables[skip_index + 1:]  # Start from the table AFTER skip_until
+                logger.info(f"Skipping tables until '{request.skip_until}' - resuming from table {skip_index + 2}/{len(tables) + skip_index + 1}")
+            except ValueError:
+                logger.warning(f"Table '{request.skip_until}' not found in table list - processing all tables")
+
+        logger.info(f"Found {len(tables)} tables to load from S3 to StarRocks")
+
+        results = {"success": [], "failed": []}
+
+        for idx, table_name in enumerate(tables, 1):
+            try:
+                logger.info(f"[{idx}/{len(tables)}] Loading {table_name}...")
+
+                # Create table in StarRocks with retry logic
+                max_retries = 3
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        mapper.create_starrocks_table(
+                            schema_name=settings.mssql_schema,
+                            table_name=table_name,
+                            target_schema=request.target_schema
+                        )
+                        break  # Success
+                    except Exception as e:
+                        error_str = str(e).lower()
+                        if "already exists" in error_str or "1050" in error_str:
+                            break  # Table exists, continue
+                        elif "lost connection" in error_str or "2013" in error_str or "110" in error_str:
+                            if attempt < max_retries:
+                                logger.warning(f"Connection error creating table (attempt {attempt}/{max_retries}), retrying in 5s...")
+                                time.sleep(5)
+                                continue
+                        raise  # Other errors or max retries exceeded
+
+                # Read from S3
+                df = pipeline.read_from_iceberg(glue_database, table_name)
+
+                # Load to StarRocks (no pre-count to avoid double scan)
+                pipeline.load_to_starrocks(
+                    df, request.target_schema, table_name, mode="append"
+                )
+
+                # Get row count from StarRocks after write
+                import mysql.connector
+                conn = mysql.connector.connect(
+                    host=settings.starrocks_host,
+                    port=settings.starrocks_port,
+                    user=settings.starrocks_user,
+                    password=settings.starrocks_password,
+                    database=request.target_schema,
+                    connect_timeout=30
+                )
+                cursor = conn.cursor()
+                cursor.execute(f"SELECT COUNT(*) FROM `{request.target_schema}`.`{table_name}`")
+                row_count = cursor.fetchone()[0]
+                cursor.close()
+                conn.close()
+
+                results["success"].append({"table": table_name, "rows": row_count})
+                logger.info(f"✓ {table_name}: {row_count:,} rows loaded")
+
+                # Small delay to prevent connection exhaustion
+                time.sleep(0.5)
+
+                # Periodic cleanup
+                if idx % 50 == 0:
+                    logger.info("Performing periodic cleanup...")
+                    mapper._close_connection()
+                    pipeline.close()
+                    import gc
+                    gc.collect()
+                    time.sleep(10)
+
+            except Exception as e:
+                logger.error(f"✗ Failed to load {table_name}: {e}")
+                results["failed"].append({"table": table_name, "error": str(e)})
+
+        migration_jobs[job_id]["status"] = "completed"
+        migration_jobs[job_id]["result"] = results
+
+        logger.info(f"S3 to StarRocks migration job {job_id} completed")
+
+    except Exception as e:
+        migration_jobs[job_id]["status"] = "failed"
+        migration_jobs[job_id]["result"] = {"error": str(e)}
+        logger.error(f"S3 to StarRocks migration job {job_id} failed: {e}")
+
+
+@app.post("/load/s3-to-starrocks", response_model=MigrationResponse, tags=["Migration"])
+def load_s3_to_starrocks(
+    request: S3ToStarRocksRequest, background_tasks: BackgroundTasks
+):
+    """
+    Load tables from S3/Iceberg to StarRocks
+
+    This endpoint reads tables from AWS Glue Catalog and loads them to StarRocks.
+    Use this after completing S3-only migration to load data to StarRocks.
+    """
+    global job_counter
+    job_counter += 1
+    job_id = job_counter
+
+    migration_jobs[job_id] = {
+        "status": "pending",
+        "request": request.dict(),
+        "result": None,
+    }
+
+    background_tasks.add_task(run_s3_to_starrocks_migration, job_id, request)
+
+    logger.info(f"Created S3 to StarRocks migration job {job_id}")
+
+    return MigrationResponse(
+        job_id=job_id,
+        status="pending",
+        message=f"S3 to StarRocks migration job {job_id} started",
+    )
 
 
 if __name__ == "__main__":

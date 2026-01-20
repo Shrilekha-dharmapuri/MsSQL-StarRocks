@@ -149,24 +149,10 @@ class PartitionOptimizer:
         #     logger.info("Small table, no partitioning needed")
         #     return None
 
-        # Priority 1: Try datetime columns
-        datetime_cols = self.get_datetime_columns(schema_name, table_name)
-        if datetime_cols:
-            col_name = datetime_cols[0]
-            logger.info(f"Found datetime column for partitioning: {col_name}")
+        # JDBC partitioning only supports numeric columns
+        # Datetime columns are used later for Iceberg partitioning in S3, not for JDBC extraction
 
-            # For datetime columns, we'll convert to numeric (epoch) in Spark
-            # Here we just return the column name
-            num_partitions = self.calculate_partition_count(row_count)
-
-            return {
-                "column": col_name,
-                "num_partitions": num_partitions,
-                "lower_bound": 0,  # Will be determined by Spark
-                "upper_bound": 999999999,  # Placeholder for datetime
-            }
-
-        # Priority 2: Try numeric columns
+        # Priority 1: Try numeric columns
         numeric_cols = self.get_numeric_columns(schema_name, table_name)
         if numeric_cols:
             col_name = numeric_cols[0]["COLUMN_NAME"]

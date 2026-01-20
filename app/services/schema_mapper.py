@@ -141,16 +141,18 @@ class SchemaMapper:
 
         # Handle sized types
         if data_type in ["char", "varchar"] and char_length:
-            # Limit to StarRocks maximum
-            length = min(char_length, 65535)
-            base_type = self.TYPE_MAPPING.get(data_type, "VARCHAR")
-            return f"{base_type}({length})"
+            # Add 20% safety buffer for data quality issues (MSSQL allows oversized data)
+            # Minimum +50 chars, maximum +500 chars buffer
+            buffer = max(50, min(int(char_length * 0.2), 500))
+            safe_length = min(char_length + buffer, 65535)
+            # Always use VARCHAR for flexibility
+            return f"VARCHAR({safe_length})"
 
         elif data_type in ["nchar", "nvarchar"] and char_length:
-            # Unicode types need double the size
-            length = min(char_length * 2, 65535)
-            base_type = self.TYPE_MAPPING.get(data_type, "VARCHAR")
-            return f"{base_type}({length})"
+            # Unicode types need double the size + safety buffer
+            buffer = max(50, min(int(char_length * 0.2), 500))
+            safe_length = min(char_length * 2 + buffer, 65535)
+            return f"VARCHAR({safe_length})"
 
         elif data_type in ["decimal", "numeric"] and numeric_precision:
             scale = numeric_scale or 0
