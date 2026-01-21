@@ -1,6 +1,6 @@
 """
-FastAPI Application - REST API for MSSQL to StarRocks Migration
-Provides endpoints for table and schema migration
+FastAPI Application - REST API for MSSQL/MySQL to StarRocks Migration
+Provides endpoints for table and schema migration from both MSSQL and MySQL sources
 """
 
 import logging
@@ -46,9 +46,9 @@ logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="MSSQL to StarRocks Migration API",
-    description="Migration pipeline using Apache Iceberg and AWS Glue Catalog",
-    version="1.0.0",
+    title="MSSQL/MySQL to StarRocks Migration API",
+    description="Migration pipeline using Apache Iceberg and AWS Glue Catalog. Supports both MSSQL and MySQL as source databases.",
+    version="2.0.0",
 )
 
 # Track migration jobs
@@ -78,6 +78,43 @@ class SchemaMigrationRequest(BaseModel):
     """Request model for schema migration"""
 
     source_schema: str = Field(..., description="MSSQL source schema name")
+    target_schema: str = Field(..., description="Target schema name")
+    table_list: Optional[List[str]] = Field(
+        default=None, description="Optional list of specific tables (None = all tables)"
+    )
+    create_tables: bool = Field(
+        default=True, description="Whether to create StarRocks tables"
+    )
+    only_s3: bool = Field(
+        default=False, description="Whether to stop after uploading to S3/Iceberg"
+    )
+    resume_from: Optional[str] = Field(
+        default=None, description="Skip all tables until this table name is found (inclusive)"
+    )
+
+
+# MySQL Request Models
+class MySQLTableMigrationRequest(BaseModel):
+    """Request model for single MySQL table migration"""
+
+    source_database: str = Field(..., description="MySQL source database name")
+    table_name: str = Field(..., description="Table name to migrate")
+    target_schema: str = Field(..., description="Target schema name (without suffix)")
+    create_table: bool = Field(
+        default=True, description="Whether to create StarRocks table first"
+    )
+    auto_partition: bool = Field(
+        default=True, description="Whether to auto-detect partition configuration"
+    )
+    only_s3: bool = Field(
+        default=False, description="Whether to stop after uploading to S3/Iceberg"
+    )
+
+
+class MySQLSchemaMigrationRequest(BaseModel):
+    """Request model for MySQL schema/database migration"""
+
+    source_database: str = Field(..., description="MySQL source database name")
     target_schema: str = Field(..., description="Target schema name")
     table_list: Optional[List[str]] = Field(
         default=None, description="Optional list of specific tables (None = all tables)"
@@ -169,19 +206,82 @@ def run_schema_migration(job_id: int, request: SchemaMigrationRequest):
         migration_jobs[job_id]["error"] = str(e)
 
 
+# MySQL Background Task Functions
+def run_mysql_table_migration(job_id: int, request: MySQLTableMigrationRequest):
+    """Background task for MySQL table migration"""
+    try:
+        logger.info(f"Starting MySQL table migration job {job_id}")
+
+        migration_jobs[job_id]["status"] = "running"
+
+        result = orchestrator.migrate_mysql_table(
+            source_database=request.source_database,
+            table_name=request.table_name,
+            target_schema=request.target_schema,
+            create_table=request.create_table,
+            auto_partition=request.auto_partition,
+            only_s3=request.only_s3,
+        )
+
+        migration_jobs[job_id]["status"] = "completed"
+        migration_jobs[job_id]["result"] = result
+
+        logger.info(f"MySQL table migration job {job_id} completed successfully")
+
+    except Exception as e:
+        logger.error(f"MySQL table migration job {job_id} failed: {e}")
+        migration_jobs[job_id]["status"] = "failed"
+        migration_jobs[job_id]["error"] = str(e)
+
+
+def run_mysql_schema_migration(job_id: int, request: MySQLSchemaMigrationRequest):
+    """Background task for MySQL schema migration"""
+    try:
+        logger.info(f"Starting MySQL schema migration job {job_id}")
+
+        migration_jobs[job_id]["status"] = "running"
+
+        result = orchestrator.migrate_mysql_schema(
+            source_database=request.source_database,
+            target_schema=request.target_schema,
+            table_list=request.table_list,
+            create_tables=request.create_tables,
+            only_s3=request.only_s3,
+            resume_from=request.resume_from,
+        )
+
+        migration_jobs[job_id]["status"] = "completed"
+        migration_jobs[job_id]["result"] = result
+
+        # Save report
+        report_file = f"mysql_migration_report_job_{job_id}.json"
+        orchestrator.save_report(report_file)
+        migration_jobs[job_id]["report_file"] = report_file
+
+        logger.info(f"MySQL schema migration job {job_id} completed successfully")
+
+    except Exception as e:
+        logger.error(f"MySQL schema migration job {job_id} failed: {e}")
+        migration_jobs[job_id]["status"] = "failed"
+        migration_jobs[job_id]["error"] = str(e)
+
+
 # API Endpoints
 @app.get("/", tags=["Root"])
 def read_root():
     """Root endpoint with API information"""
     return {
-        "name": "MSSQL to StarRocks Migration API",
-        "version": "1.0.0",
+        "name": "MSSQL/MySQL to StarRocks Migration API",
+        "version": "2.0.0",
         "description": "Migration pipeline using Apache Iceberg and AWS Glue Catalog",
         "endpoints": {
             "/health": "Health check",
-            "/migrate/table": "Migrate single table",
-            "/migrate/schema": "Migrate entire schema",
+            "/migrate/table": "Migrate single MSSQL table",
+            "/migrate/schema": "Migrate entire MSSQL schema",
+            "/migrate/mysql/table": "Migrate single MySQL table",
+            "/migrate/mysql/schema": "Migrate entire MySQL database",
             "/migration/status/{job_id}": "Check migration job status",
+            "/load/s3-to-starrocks": "Load from S3/Iceberg to StarRocks",
         },
     }
 
@@ -191,9 +291,10 @@ def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "service": "MSSQL to StarRocks Migration",
+        "service": "MSSQL/MySQL to StarRocks Migration",
         "configuration": {
             "mssql_host": settings.mssql_host,
+            "mysql_source_host": settings.mysql_source_host,
             "starrocks_host": settings.starrocks_host,
             "s3_bucket": settings.s3_bucket,
             "aws_region": settings.aws_region,
@@ -265,6 +366,74 @@ def migrate_schema(request: SchemaMigrationRequest, background_tasks: Background
     )
 
 
+# ==================== MySQL Migration Endpoints ====================
+
+@app.post("/migrate/mysql/table", response_model=MigrationResponse, tags=["MySQL Migration"])
+def migrate_mysql_table(request: MySQLTableMigrationRequest, background_tasks: BackgroundTasks):
+    """
+    Migrate a single table from MySQL to StarRocks via Iceberg
+
+    This endpoint starts a background migration job and returns immediately with a job ID.
+    Use the `/migration/status/{job_id}` endpoint to check progress.
+    """
+    global job_counter
+    job_counter += 1
+    job_id = job_counter
+
+    # Initialize job tracking
+    migration_jobs[job_id] = {
+        "status": "pending",
+        "request": request.dict(),
+        "result": None,
+        "source_type": "mysql"
+    }
+
+    # Start background task
+    background_tasks.add_task(run_mysql_table_migration, job_id, request)
+
+    logger.info(
+        f"Created MySQL migration job {job_id} for table {request.source_database}.{request.table_name}"
+    )
+
+    return MigrationResponse(
+        job_id=job_id,
+        status="pending",
+        message=f"MySQL migration job {job_id} started for table {request.table_name}",
+    )
+
+
+@app.post("/migrate/mysql/schema", response_model=MigrationResponse, tags=["MySQL Migration"])
+def migrate_mysql_schema(request: MySQLSchemaMigrationRequest, background_tasks: BackgroundTasks):
+    """
+    Migrate entire database from MySQL to StarRocks via Iceberg
+
+    This endpoint starts a background migration job for all tables in the MySQL database.
+    Use the `/migration/status/{job_id}` endpoint to check progress.
+    """
+    global job_counter
+    job_counter += 1
+    job_id = job_counter
+
+    # Initialize job tracking
+    migration_jobs[job_id] = {
+        "status": "pending",
+        "request": request.dict(),
+        "result": None,
+        "source_type": "mysql"
+    }
+
+    # Start background task
+    background_tasks.add_task(run_mysql_schema_migration, job_id, request)
+
+    logger.info(f"Created MySQL schema migration job {job_id} for database {request.source_database}")
+
+    return MigrationResponse(
+        job_id=job_id,
+        status="pending",
+        message=f"MySQL schema migration job {job_id} started for {request.source_database}",
+    )
+
+
 @app.get(
     "/migration/status/{job_id}",
     response_model=JobStatusResponse,
@@ -295,6 +464,12 @@ def get_configuration():
             "port": settings.mssql_port,
             "database": settings.mssql_database,
             "schema": settings.mssql_schema,
+        },
+        "mysql_source": {
+            "host": settings.mysql_source_host,
+            "port": settings.mysql_source_port,
+            "database": settings.mysql_source_database,
+            "charset": settings.mysql_source_charset,
         },
         "starrocks": {
             "host": settings.starrocks_host,

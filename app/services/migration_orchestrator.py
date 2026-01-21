@@ -1,6 +1,7 @@
 """
 Migration Orchestrator - High-level pipeline orchestration
 Handles schema and table migrations with error handling and reporting
+Supports both MSSQL and MySQL as source databases
 """
 
 import logging
@@ -18,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 class MigrationOrchestrator:
-    """Orchestrates migrations with retry logic and reporting"""
+    """Orchestrates migrations with retry logic and reporting for MSSQL and MySQL"""
 
     def __init__(self):
         self.migration_results = []
@@ -415,6 +416,362 @@ class MigrationOrchestrator:
 
         finally:
             # CRITICAL: Always close connections
+            if cursor:
+                try:
+                    cursor.close()
+                except:
+                    pass
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass
+
+    # ==================== MySQL Migration Methods ====================
+
+    def migrate_mysql_table(
+        self,
+        source_database: str,
+        table_name: str,
+        target_schema: str,
+        create_table: bool = True,
+        auto_partition: bool = True,
+        only_s3: bool = False,
+    ) -> Dict:
+        """
+        Migrate a single table from MySQL with retry logic
+
+        Args:
+            source_database: MySQL source database name
+            table_name: Table name to migrate
+            target_schema: Target schema name (without suffix)
+            create_table: Whether to create StarRocks table first
+            auto_partition: Whether to auto-detect partition configuration
+            only_s3: If True, stops after writing to S3/Iceberg
+
+        Returns:
+            Migration result dictionary
+        """
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Starting MySQL migration: {source_database}.{table_name} (S3 Only: {only_s3})")
+        logger.info(f"{'='*60}\n")
+
+        result = {
+            "source_database": source_database,
+            "table_name": table_name,
+            "target_schema": target_schema,
+            "status": "pending",
+            "error": None,
+            "attempts": 0,
+            "only_s3": only_s3,
+            "source_type": "mysql"
+        }
+
+        # Step 1: Create StarRocks table if requested and NOT only_s3
+        if create_table and not only_s3:
+            for attempt in range(1, 4):  # Try 3 times
+                try:
+                    logger.info(f"Step 1: Creating StarRocks table from MySQL schema (attempt {attempt}/3)...")
+                    mapper.create_starrocks_table_from_mysql(
+                        source_database, table_name, target_schema
+                    )
+                    result["table_created"] = True
+                    break
+                except Exception as e:
+                    error_str = str(e)
+
+                    is_connection_error = (
+                        "Can't connect" in error_str or
+                        "Connection refused" in error_str or
+                        "Lost connection" in error_str or
+                        "2003" in error_str or
+                        "2013" in error_str or
+                        "Timeout" in error_str
+                    )
+
+                    if is_connection_error and attempt < 3:
+                        logger.warning(f"Connection error on attempt {attempt}: {e}")
+                        logger.info(f"Retrying in {attempt * 2} seconds...")
+                        time.sleep(attempt * 2)
+                        continue
+                    else:
+                        logger.error(f"Failed to create table: {e}")
+                        result["status"] = "failed"
+                        result["error"] = f"Table creation failed: {str(e)}"
+                        return result
+
+        # Step 2: Get partition configuration
+        partition_config = None
+        if auto_partition:
+            try:
+                logger.info("Step 2: Analyzing MySQL partition strategy...")
+                partition_config = optimizer.get_mysql_optimal_partition_config(
+                    source_database, table_name
+                )
+                result["partition_config"] = partition_config
+            except Exception as e:
+                logger.warning(f"Failed to get partition config: {e}")
+
+        # Step 3: Execute migration with retry
+        for attempt in range(1, settings.max_retry_attempts + 1):
+            result["attempts"] = attempt
+
+            try:
+                logger.info(
+                    f"Step 3: Executing MySQL migration (attempt {attempt}/{settings.max_retry_attempts})..."
+                )
+
+                # Step 3a: Extract from MySQL
+                df = pipeline.extract_mysql_table(source_database, table_name, partition_config)
+                mysql_count = df.count()
+                result["mysql_row_count"] = mysql_count
+
+                # Step 3b: Write to Iceberg (S3)
+                iceberg_schema = f"{target_schema}{settings.target_schema_suffix}"
+                pipeline.write_to_iceberg(df, iceberg_schema, table_name)
+                result["iceberg_row_count"] = mysql_count
+
+                # CRITICAL: Unpersist the cached DataFrame to free memory
+                try:
+                    df.unpersist()
+                    logger.debug("Unpersisted source DataFrame to free memory")
+                except Exception as e:
+                    logger.warning(f"Failed to unpersist DataFrame: {e}")
+
+                # If only_s3 is True, we stop here
+                if only_s3:
+                    result["status"] = "success"
+                    result["message"] = "Data successfully stored in S3/Iceberg. StarRocks step skipped."
+                    logger.info(f"✓ S3-Only MySQL Migration completed: {mysql_count:,} rows landed in S3.")
+                    break
+
+                # Step 3c: Load to StarRocks
+                logger.info("Reading back from S3/Iceberg for StarRocks ingestion...")
+                iceberg_df = pipeline.read_from_iceberg(iceberg_schema, table_name)
+                pipeline.load_to_starrocks(iceberg_df, target_schema, table_name)
+
+                # CRITICAL: Unpersist the Iceberg DataFrame to free memory
+                try:
+                    iceberg_df.unpersist()
+                    logger.debug("Unpersisted Iceberg DataFrame to free memory")
+                except Exception as e:
+                    logger.warning(f"Failed to unpersist Iceberg DataFrame: {e}")
+
+                # Success!
+                result["status"] = "success"
+                logger.info(
+                    f"\n✓ Full MySQL Migration completed successfully: {table_name}\n"
+                )
+                break
+
+            except Exception as e:
+                error_str = str(e)
+                logger.error(f"Attempt {attempt} failed: {error_str}")
+                result["error"] = error_str
+
+                is_oom_or_connection_error = (
+                    "OutOfMemoryError" in error_str or
+                    "Connection refused" in error_str or
+                    "Py4JNetworkError" in error_str or
+                    "Answer from Java side is empty" in error_str
+                )
+
+                if is_oom_or_connection_error:
+                    logger.warning("Detected Spark session crash. Forcing cleanup...")
+                    try:
+                        pipeline.close()
+                        logger.info("Spark session closed. Will reinitialize on retry.")
+                    except Exception as close_err:
+                        logger.warning(f"Failed to close pipeline after crash: {close_err}")
+                        pipeline.spark = None
+
+                if attempt < settings.max_retry_attempts:
+                    retry_delay = settings.retry_delay_seconds * 2 if is_oom_or_connection_error else settings.retry_delay_seconds
+                    logger.info(f"Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                else:
+                    result["status"] = "failed"
+                    logger.error(f"\n✗ MySQL Migration failed after {attempt} attempts\n")
+
+                    try:
+                        pipeline.close()
+                    except Exception as close_err:
+                        logger.warning(f"Failed to close pipeline after error: {close_err}")
+                        pipeline.spark = None
+
+        self.migration_results.append(result)
+        return result
+
+    def migrate_mysql_schema(
+        self,
+        source_database: str,
+        target_schema: str,
+        table_list: Optional[List[str]] = None,
+        create_tables: bool = True,
+        only_s3: bool = False,
+        resume_from: Optional[str] = None,
+    ) -> Dict:
+        """
+        Migrate all tables from a MySQL database
+
+        Args:
+            source_database: MySQL source database name
+            target_schema: Target schema name
+            table_list: Optional list of specific tables to migrate (None = all)
+            create_tables: Whether to create StarRocks tables
+            only_s3: Whether to stop after S3/Iceberg phase
+            resume_from: Table name to resume from (inclusive)
+
+        Returns:
+            Summary of migration results
+        """
+        logger.info(f"\n{'#'*60}")
+        logger.info(f"# MySQL SCHEMA MIGRATION: {source_database} → {target_schema}")
+        if resume_from:
+            logger.info(f"# Resuming from: {resume_from}")
+        logger.info(f"{'#'*60}\n")
+
+        start_time = datetime.now()
+
+        # Get list of tables if not provided
+        if table_list is None:
+            logger.info("Discovering tables in MySQL database...")
+            table_list = mapper.get_mysql_tables(source_database)
+            logger.info(f"Found {len(table_list)} tables to migrate")
+
+        # Migrate each table
+        successful = 0
+        failed = 0
+
+        skipping = True if resume_from else False
+
+        for idx, table_name in enumerate(table_list, 1):
+            if skipping:
+                if table_name == resume_from:
+                    skipping = False
+                    logger.info(f"Checking {table_name}: Found resume point. Starting migration.")
+                else:
+                    logger.info(f"[{idx}/{len(table_list)}] Skipping {table_name} (before resume point)")
+                    continue
+
+            logger.info(f"\n[{idx}/{len(table_list)}] Migrating MySQL table: {table_name}")
+
+            result = self.migrate_mysql_table(
+                source_database=source_database,
+                table_name=table_name,
+                target_schema=target_schema,
+                create_table=create_tables,
+                only_s3=only_s3,
+            )
+
+            if result["status"] == "success":
+                successful += 1
+            else:
+                failed += 1
+
+            # CRITICAL: Periodic cleanup every 50 tables
+            if idx % 50 == 0:
+                logger.info(f"Performing periodic cleanup after {idx} tables...")
+                try:
+                    mapper._close_mysql_source_connection()
+                    logger.info("Restarting Spark session to free memory...")
+                    pipeline.close()
+
+                    import gc
+                    gc.collect()
+
+                    logger.info("Periodic cleanup completed. Continuing migration...")
+                    time.sleep(5)
+                except Exception as e:
+                    logger.warning(f"Error during periodic cleanup: {e}")
+
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
+
+        # Summary
+        summary = {
+            "source_database": source_database,
+            "target_schema": target_schema,
+            "source_type": "mysql",
+            "total_tables": len(table_list),
+            "successful": successful,
+            "failed": failed,
+            "duration_seconds": duration,
+            "start_time": start_time.isoformat(),
+            "end_time": end_time.isoformat(),
+            "results": self.migration_results,
+        }
+
+        logger.info(f"\n{'#'*60}")
+        logger.info(f"# MySQL MIGRATION SUMMARY")
+        logger.info(f"{'#'*60}")
+        logger.info(f"Total Tables: {len(table_list)}")
+        logger.info(f"Successful: {successful}")
+        logger.info(f"Failed: {failed}")
+        logger.info(f"Duration: {duration:.2f} seconds")
+        logger.info(f"{'#'*60}\n")
+
+        return summary
+
+    def validate_mysql_migration(
+        self, source_database: str, table_name: str, target_schema: str
+    ) -> Dict:
+        """
+        Validate MySQL migration by comparing row counts
+
+        Returns:
+            Validation result dictionary
+        """
+        logger.info(f"Validating MySQL migration for {table_name}...")
+
+        # Get MySQL source row count
+        mysql_count = mapper.get_mysql_table_row_count(source_database, table_name)
+
+        # Get StarRocks row count
+        import mysql.connector
+
+        conn = None
+        cursor = None
+
+        try:
+            conn = mysql.connector.connect(
+                host=settings.starrocks_host,
+                port=settings.starrocks_port,
+                user=settings.starrocks_user,
+                password=settings.starrocks_password,
+                database=target_schema,
+                connect_timeout=30,
+                pool_size=5,
+                pool_name="starrocks_mysql_validation_pool",
+                pool_reset_session=True
+            )
+
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT COUNT(*) FROM `{target_schema}`.`{table_name}`")
+            starrocks_count = cursor.fetchone()[0]
+
+            is_valid = mysql_count == starrocks_count
+
+            result = {
+                "table_name": table_name,
+                "source_type": "mysql",
+                "mysql_count": mysql_count,
+                "starrocks_count": starrocks_count,
+                "is_valid": is_valid,
+                "difference": abs(mysql_count - starrocks_count),
+            }
+
+            if is_valid:
+                logger.info(f"✓ Validation passed: {mysql_count:,} rows match")
+            else:
+                logger.warning(
+                    f"✗ Validation failed: MySQL={mysql_count:,}, "
+                    f"StarRocks={starrocks_count:,}"
+                )
+
+            return result
+
+        finally:
             if cursor:
                 try:
                     cursor.close()

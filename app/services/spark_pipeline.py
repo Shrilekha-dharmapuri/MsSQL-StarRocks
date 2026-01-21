@@ -1,6 +1,7 @@
 """
 Spark Pipeline Service - Core ETL Logic
-Handles MSSQL → Iceberg → StarRocks data migration
+Handles MSSQL/MySQL → Iceberg → StarRocks data migration
+Supports both MSSQL and MySQL as source databases
 """
 
 import os
@@ -16,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 class SparkPipeline:
-    """Core Spark pipeline for MSSQL to Iceberg to StarRocks migration"""
+    """Core Spark pipeline for MSSQL/MySQL to Iceberg to StarRocks migration"""
 
     def __init__(self):
         self.spark: Optional[SparkSession] = None
@@ -189,11 +190,98 @@ class SparkPipeline:
 
         return df
 
+    def extract_mysql_table(
+        self,
+        database_name: str,
+        table_name: str,
+        partition_config: Optional[Dict] = None,
+    ) -> DataFrame:
+        """
+        Extract table from MySQL source using JDBC with parallel partitioning
+
+        Args:
+            database_name: MySQL database name (acts as schema)
+            table_name: Table name to extract
+            partition_config: Optional partition configuration with keys:
+                - column: partition column name
+                - num_partitions: number of partitions
+                - lower_bound: lower bound value
+                - upper_bound: upper bound value
+
+        Returns:
+            Spark DataFrame with extracted data
+        """
+        spark = self.get_spark_session()
+        logger.info(f"Extracting table: {database_name}.{table_name} from MySQL source...")
+
+        # Build JDBC read options for MySQL
+        jdbc_options = {
+            "url": settings.mysql_source_jdbc_url,
+            "dbtable": f"`{database_name}`.`{table_name}`",
+            "user": settings.mysql_source_user,
+            "password": settings.mysql_source_password,
+            "driver": "com.mysql.cj.jdbc.Driver",
+            "fetchsize": str(settings.jdbc_fetch_size),
+        }
+
+        # Add partitioning options if provided
+        if partition_config:
+            jdbc_options.update(
+                {
+                    "partitionColumn": partition_config.get("column"),
+                    "numPartitions": str(partition_config.get("num_partitions", 20)),
+                    "lowerBound": str(partition_config.get("lower_bound", 0)),
+                    "upperBound": str(
+                        partition_config.get("upper_bound", 10000000)
+                    ),
+                }
+            )
+            logger.info(
+                f"Using partitioning: column={partition_config.get('column')}, "
+                f"partitions={partition_config.get('num_partitions')}"
+            )
+
+        # Read from MySQL
+        df = spark.read.format("jdbc").options(**jdbc_options).load()
+
+        # Add audit columns (use database as source identifier)
+        df = self._add_mysql_audit_columns(df, database_name)
+
+        # Cache for performance (will be unpersisted after use in orchestrator)
+        df = df.cache()
+        row_count = df.count()
+        logger.info(f"Extracted {row_count:,} rows from MySQL {database_name}.{table_name}")
+
+        return df
+
     def _add_audit_columns(self, df: DataFrame, source_schema: str) -> DataFrame:
-        """Add audit columns to DataFrame"""
+        """Add audit columns to DataFrame (MSSQL)"""
         return df.withColumn(
             "migrated_at", F.lit(datetime.now().isoformat())
         ).withColumn("source_schema", F.lit(source_schema))
+
+    def _add_mysql_audit_columns(self, df: DataFrame, source_database: str) -> DataFrame:
+        """Add audit columns to DataFrame (MySQL)"""
+        return df.withColumn(
+            "migrated_at", F.lit(datetime.now().isoformat())
+        ).withColumn("source_database", F.lit(source_database))
+
+    def _sanitize_iceberg_name(self, name: str) -> str:
+        """Sanitize table/schema name for Iceberg/Glue compatibility
+
+        - Replaces spaces with underscores
+        - Replaces dots with underscores
+        - Replaces other special characters with underscores
+        - Converts to lowercase (Glue requirement)
+        """
+        import re
+        # Replace spaces, dots, and other special chars with underscores
+        sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', name)
+        # Remove consecutive underscores
+        sanitized = re.sub(r'_+', '_', sanitized)
+        # Remove leading/trailing underscores
+        sanitized = sanitized.strip('_')
+        return sanitized.lower()
 
     def write_to_iceberg(
         self, df: DataFrame, schema_name: str, table_name: str
@@ -203,9 +291,9 @@ class SparkPipeline:
         """
         spark = self.get_spark_session()
 
-        # AWS Glue requires lowercase identifiers
-        glue_schema_name = schema_name.lower()
-        table_name_lower = table_name.lower()
+        # AWS Glue requires lowercase identifiers and no special characters
+        glue_schema_name = self._sanitize_iceberg_name(schema_name)
+        table_name_lower = self._sanitize_iceberg_name(table_name)
 
         logger.info(
             f"Steps 2-4: Writing to Iceberg: {glue_schema_name}.{table_name_lower} "
@@ -241,7 +329,10 @@ class SparkPipeline:
             # Only partition by date if table has significant data and date column exists
             # For small tables, skip partitioning to save memory
             # For medium tables (100k-1M rows), use date partitioning for better query performance
-            if partition_col and row_count > 1000:
+            # IMPORTANT: Skip partitioning for dimension tables where rows ~= days (e.g., time_dimension)
+            # because each row becomes its own partition, causing OOM
+            is_dimension_table = "dimension" in table_name_lower or "dim_" in table_name_lower
+            if partition_col and row_count > 100000 and not is_dimension_table:
                 # Use days partitioning to create the Date-based folder structure on S3
                 # This creates one partition per day, which can be memory-intensive
                 # For tables > 100k rows, this is beneficial for query performance
@@ -272,8 +363,9 @@ class SparkPipeline:
         """
         spark = self.get_spark_session()
 
-        glue_schema_name = schema_name.lower()
-        table_name_lower = table_name.lower()
+        # Use same sanitization as write_to_iceberg
+        glue_schema_name = self._sanitize_iceberg_name(schema_name)
+        table_name_lower = self._sanitize_iceberg_name(table_name)
         full_table_name = f"{glue_schema_name}.{table_name_lower}"
 
         logger.info(f"Reading from Iceberg table: {full_table_name}")
@@ -319,6 +411,54 @@ class SparkPipeline:
                 num_partitions = 4  # Minimum for performance
         
         logger.info(f"Writing to StarRocks with {num_partitions} partitions")
+
+        # Get StarRocks table column order and types to ensure correct mapping
+        # JDBC writes by position, so we must match the target table's column order AND types
+        import mysql.connector
+        try:
+            conn = mysql.connector.connect(
+                host=settings.starrocks_host,
+                port=settings.starrocks_port,
+                user=settings.starrocks_user,
+                password=settings.starrocks_password or '',
+            )
+            cursor = conn.cursor()
+            cursor.execute(f"DESCRIBE `{target_schema}`.`{table_name}`")
+            # Get column name and type: DESCRIBE returns (Field, Type, Null, Key, Default, Extra)
+            sr_schema = [(row[0].lower(), row[1].upper()) for row in cursor.fetchall()]
+            cursor.close()
+            conn.close()
+
+            # Reorder DataFrame columns to match StarRocks table order (case-insensitive)
+            # AND cast to correct types to prevent type mismatches
+            df_columns_lower = {c.lower(): c for c in df.columns}
+            ordered_cols = []
+            for sr_col, sr_type in sr_schema:
+                if sr_col in df_columns_lower:
+                    col_expr = F.col(df_columns_lower[sr_col])
+                    # Cast to correct type based on StarRocks schema
+                    if sr_type.startswith("DATE") and not sr_type.startswith("DATETIME"):
+                        col_expr = col_expr.cast("date")
+                    elif sr_type.startswith("DATETIME"):
+                        col_expr = col_expr.cast("timestamp")
+                    elif sr_type.startswith("INT") or sr_type == "BIGINT" or sr_type == "SMALLINT" or sr_type == "TINYINT":
+                        col_expr = col_expr.cast("int") if sr_type.startswith("INT") else col_expr.cast(sr_type.lower())
+                    elif sr_type.startswith("DECIMAL"):
+                        col_expr = col_expr.cast(sr_type.lower())
+                    elif sr_type == "DOUBLE" or sr_type == "FLOAT":
+                        col_expr = col_expr.cast(sr_type.lower())
+                    elif sr_type.startswith("VARCHAR") or sr_type == "STRING" or sr_type.startswith("CHAR"):
+                        col_expr = col_expr.cast("string")
+                    ordered_cols.append(col_expr.alias(sr_col))
+                else:
+                    logger.warning(f"Column {sr_col} not found in DataFrame, using NULL")
+                    ordered_cols.append(F.lit(None).alias(sr_col))
+
+            df = df.select(ordered_cols)
+            logger.info(f"Reordered DataFrame columns to match StarRocks table schema with type casting")
+        except Exception as e:
+            logger.warning(f"Could not fetch StarRocks schema for column ordering: {e}")
+            # Continue with original order - may fail if columns don't match
 
         # Write to StarRocks via JDBC with optimized connection settings
         # Skip df.count() to avoid scanning S3 twice
@@ -418,6 +558,71 @@ class SparkPipeline:
 
         except Exception as e:
             logger.error(f"Migration failed for {source_schema}.{table_name}: {e}")
+            raise
+
+    def migrate_mysql_table(
+        self,
+        source_database: str,
+        table_name: str,
+        target_schema: str,
+        partition_config: Optional[Dict] = None,
+    ) -> Dict:
+        """
+        Complete 5-step migration pipeline for MySQL:
+        1. MySQL to Spark
+        2. Spark + Iceberg -> Parquet
+        3. Metadata -> AWS Glue
+        4. Store in S3
+        5. S3 -> StarRocks
+        """
+        start_time = datetime.now()
+        logger.info(
+            f"Starting 5-step MySQL migration: {source_database}.{table_name} → "
+            f"{target_schema}.{table_name}"
+        )
+
+        try:
+            # Step 1: Extract from MySQL and ingest into Spark
+            logger.info("Step 1: Extracting data from MySQL to Spark...")
+            df = self.extract_mysql_table(source_database, table_name, partition_config)
+            mysql_count = df.count()
+            logger.info(f"Ingested {mysql_count:,} rows into Spark")
+
+            # Steps 2, 3, 4: Write to Iceberg (Parquet + Glue + S3)
+            logger.info("Steps 2-4: Storing as Iceberg/Parquet in S3 with Glue Metadata...")
+            iceberg_schema = f"{target_schema}{settings.target_schema_suffix}"
+            self.write_to_iceberg(df, iceberg_schema, table_name)
+
+            # Step 5: Ingest data FROM S3 into StarRocks
+            logger.info("Step 5: Ingesting data FROM S3 (via Iceberg) into StarRocks...")
+            # We explicitly read back from Iceberg/S3 to fulfill Step 5
+            iceberg_df = self.read_from_iceberg(iceberg_schema, table_name)
+            iceberg_count = iceberg_df.count()
+
+            self.load_to_starrocks(iceberg_df, target_schema, table_name)
+
+            end_time = datetime.now()
+            duration = (end_time - start_time).total_seconds()
+
+            result = {
+                "status": "success",
+                "source_database": source_database,
+                "target_schema": target_schema,
+                "table_name": table_name,
+                "mysql_row_count": mysql_count,
+                "iceberg_row_count": iceberg_count,
+                "duration_seconds": duration,
+                "start_time": start_time.isoformat(),
+                "end_time": end_time.isoformat(),
+            }
+
+            logger.info(
+                f"5-step MySQL migration completed successfully in {duration:.2f}s"
+            )
+            return result
+
+        except Exception as e:
+            logger.error(f"MySQL migration failed for {source_database}.{table_name}: {e}")
             raise
 
     def close(self):

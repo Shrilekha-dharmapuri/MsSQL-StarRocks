@@ -24,6 +24,14 @@ class Settings(BaseSettings):
         default=False, description="Trust server certificate"
     )
 
+    # MySQL Source Database Configuration
+    mysql_source_host: Optional[str] = Field(default=None, description="MySQL source server hostname")
+    mysql_source_port: int = Field(default=3306, description="MySQL source server port")
+    mysql_source_user: Optional[str] = Field(default=None, description="MySQL source username")
+    mysql_source_password: str = Field(default="", description="MySQL source password")
+    mysql_source_database: Optional[str] = Field(default=None, description="MySQL source database name")
+    mysql_source_charset: str = Field(default="utf8mb4", description="MySQL source character set")
+
     # StarRocks Target Database Configuration
     starrocks_host: Optional[str] = Field(default=None, description="StarRocks server hostname")
     starrocks_port: int = Field(default=9030, description="StarRocks query port")
@@ -111,6 +119,21 @@ class Settings(BaseSettings):
         """StarRocks JDBC connection URL"""
         db_part = f"/{self.starrocks_database}" if self.starrocks_database else ""
         return f"jdbc:mysql://{self.starrocks_host}:{self.starrocks_port}{db_part}"
+
+    @property
+    def mysql_source_jdbc_url(self) -> str:
+        """MySQL Source JDBC connection URL"""
+        if not self.mysql_source_host:
+            return ""
+        # Note: JDBC uses Java encoding names, not MySQL charset names
+        # utf8mb4 in MySQL maps to UTF-8 in Java
+        # The characterEncoding parameter must use Java charset names
+        return (
+            f"jdbc:mysql://{self.mysql_source_host}:{self.mysql_source_port}"
+            f"/{self.mysql_source_database}?characterEncoding=UTF-8"
+            f"&useUnicode=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC"
+            f"&zeroDateTimeBehavior=convertToNull"
+        )
 
 
 # Global settings instance
